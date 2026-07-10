@@ -124,3 +124,41 @@ class CompaniesHouseClient:
             start_index += len(items)
             if start_index >= total_count:
                 return
+
+    def advanced_search_page(self, start_index: int, size: int, **filters) -> dict:
+        """
+        Single page of /advanced-search/companies. `filters` may include any
+        of: company_name_includes, company_name_excludes, company_status,
+        company_subtype, company_type, dissolved_from, dissolved_to,
+        incorporated_from, incorporated_to, location, sic_codes.
+        No transformation — raw response passed through.
+        """
+        params = {"start_index": start_index, "size": size, **filters}
+        return self._get("/advanced-search/companies", params=params)
+
+    def iter_advanced_search(self, sample_size: int, **filters) -> Iterator[dict]:
+        """
+        Yields raw company summary dicts from advanced search, up to
+        sample_size total, paging via start_index. CH's `size` param caps
+        at 5000 per page; sample_size can exceed that and this will page.
+        """
+        start_index = 0
+        yielded = 0
+        page_size = min(sample_size, 5000)
+
+        while yielded < sample_size:
+            remaining = sample_size - yielded
+            page = self.advanced_search_page(
+                start_index, min(page_size, remaining), **filters
+            )
+            items = page.get("items", [])
+            if not items:
+                return
+
+            for item in items:
+                yield item
+                yielded += 1
+                if yielded >= sample_size:
+                    return
+
+            start_index += len(items)
