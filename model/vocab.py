@@ -24,6 +24,7 @@ logger = logging.getLogger("ch_pipeline.model.vocab")
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"  # for subtype/type values not seen during vocab building (test-time novelty)
+MASK_TOKEN = "<MASK>"  # for MLM-style masked prediction training
 
 
 class EventVocab:
@@ -60,6 +61,18 @@ class EventVocab:
     def encode_company(self, value: str) -> int:
         return self.company_to_id.get(value, self.company_to_id[UNK_TOKEN])
 
+    @property
+    def category_mask_id(self) -> int:
+        return self.category_to_id[MASK_TOKEN]
+
+    @property
+    def type_mask_id(self) -> int:
+        return self.type_to_id[MASK_TOKEN]
+
+    @property
+    def subtype_mask_id(self) -> int:
+        return self.subtype_to_id[MASK_TOKEN]
+
     def encode_category(self, value: str) -> int:
         return self.category_to_id.get(value, self.category_to_id[UNK_TOKEN])
 
@@ -91,9 +104,11 @@ class EventVocab:
             return cls.from_dict(json.load(f))
 
 
-def _build_single_vocab(values: list[str]) -> dict:
+def _build_single_vocab(values: list[str], include_mask: bool = False) -> dict:
     counter = Counter(values)
     vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
+    if include_mask:
+        vocab[MASK_TOKEN] = 2
     # Sort by frequency descending for readability/debuggability — doesn't
     # affect model behaviour, embedding lookup doesn't care about id order.
     for value, _ in counter.most_common():
@@ -144,10 +159,10 @@ def build_vocab_from_derived_events(derived_event_paths: list[str]) -> EventVoca
     )
 
     vocab = EventVocab(
-        category_to_id=_build_single_vocab(categories),
-        type_to_id=_build_single_vocab(types),
-        subtype_to_id=_build_single_vocab(subtypes),
-        company_to_id=_build_single_vocab(companies),
+        category_to_id=_build_single_vocab(categories, include_mask=True),
+        type_to_id=_build_single_vocab(types, include_mask=True),
+        subtype_to_id=_build_single_vocab(subtypes, include_mask=True),
+        company_to_id=_build_single_vocab(companies, include_mask=False),
     )
     logger.info(
         "Vocab sizes: category=%d type=%d subtype=%d company=%d",
