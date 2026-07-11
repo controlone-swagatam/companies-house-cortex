@@ -35,10 +35,11 @@ class EventVocab:
     (test) or at inference time.
     """
 
-    def __init__(self, category_to_id: dict, type_to_id: dict, subtype_to_id: dict):
+    def __init__(self, category_to_id: dict, type_to_id: dict, subtype_to_id: dict, company_to_id: dict):
         self.category_to_id = category_to_id
         self.type_to_id = type_to_id
         self.subtype_to_id = subtype_to_id
+        self.company_to_id = company_to_id
 
     @property
     def n_categories(self) -> int:
@@ -51,6 +52,13 @@ class EventVocab:
     @property
     def n_subtypes(self) -> int:
         return len(self.subtype_to_id)
+
+    @property
+    def n_companies(self) -> int:
+        return len(self.company_to_id)
+
+    def encode_company(self, value: str) -> int:
+        return self.company_to_id.get(value, self.company_to_id[UNK_TOKEN])
 
     def encode_category(self, value: str) -> int:
         return self.category_to_id.get(value, self.category_to_id[UNK_TOKEN])
@@ -66,11 +74,12 @@ class EventVocab:
             "category_to_id": self.category_to_id,
             "type_to_id": self.type_to_id,
             "subtype_to_id": self.subtype_to_id,
+            "company_to_id": self.company_to_id,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "EventVocab":
-        return cls(d["category_to_id"], d["type_to_id"], d["subtype_to_id"])
+        return cls(d["category_to_id"], d["type_to_id"], d["subtype_to_id"], d["company_to_id"])
 
     def save(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
@@ -111,7 +120,7 @@ def build_vocab_from_derived_events(derived_event_paths: list[str]) -> EventVoca
                 "intentional.", path,
             )
 
-    categories, types, subtypes = [], [], []
+    categories, types, subtypes, companies = [], [], [], []
 
     for path in derived_event_paths:
         with open(path, encoding="utf-8") as f:
@@ -126,20 +135,23 @@ def build_vocab_from_derived_events(derived_event_paths: list[str]) -> EventVoca
                     types.append(event["type"])
                 if event.get("subtype"):
                     subtypes.append(event["subtype"])
+                if event.get("company_number"):
+                    companies.append(event["company_number"])
 
     logger.info(
-        "Building vocab from %d category, %d type, %d subtype observations",
-        len(categories), len(types), len(subtypes),
+        "Building vocab from %d category, %d type, %d subtype, %d company observations",
+        len(categories), len(types), len(subtypes), len(companies),
     )
 
     vocab = EventVocab(
         category_to_id=_build_single_vocab(categories),
         type_to_id=_build_single_vocab(types),
         subtype_to_id=_build_single_vocab(subtypes),
+        company_to_id=_build_single_vocab(companies),
     )
     logger.info(
-        "Vocab sizes: category=%d type=%d subtype=%d",
-        vocab.n_categories, vocab.n_types, vocab.n_subtypes,
+        "Vocab sizes: category=%d type=%d subtype=%d company=%d",
+        vocab.n_categories, vocab.n_types, vocab.n_subtypes, vocab.n_companies,
     )
     return vocab
 

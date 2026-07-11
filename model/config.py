@@ -21,9 +21,19 @@ class EmbeddingConfig:
 
     entity_dim: int = 16  # company-only, no dyad (per earlier decision) — small, single lookup
 
-    # DecayedSinusoidalPE
-    pe_alpha: float = 1.0  # fixed, not learned — matches GDELT design
-    pe_max_period: float = 10000.0  # standard sinusoidal max period
+    # DecayedSinusoidalPE vs plain learned positional embedding.
+    # IMPORTANT: model.py (the actual GDELT reference code) uses a plain
+    # learned nn.Embedding(max_seq_len, d_model) for position — NOT
+    # DecayedSinusoidalPE, despite that being the documented "canonical"
+    # design. This is a real conflict between the working doc and the
+    # deployed code, not just a style difference — decayed sinusoidal PE
+    # has a real rationale for CH too (irregular filing intervals), so
+    # this is kept as an explicit choice rather than silently resolved.
+    # Default matches model.py per the "reconcile as-is" instruction.
+    positional_encoding_type: str = "learned"  # "learned" | "decayed_sinusoidal"
+    max_seq_len: int = 512  # only used when positional_encoding_type == "learned"
+    pe_alpha: float = 1.0  # fixed, not learned — only used when "decayed_sinusoidal"
+    pe_max_period: float = 10000.0  # only used when "decayed_sinusoidal"
 
     dropout: float = 0.1
 
