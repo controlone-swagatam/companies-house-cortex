@@ -22,18 +22,15 @@ class EmbeddingConfig:
     entity_dim: int = 16  # company-only, no dyad (per earlier decision) — small, single lookup
 
     # DecayedSinusoidalPE vs plain learned positional embedding.
-    # IMPORTANT: model.py (the actual GDELT reference code) uses a plain
-    # learned nn.Embedding(max_seq_len, d_model) for position — NOT
-    # DecayedSinusoidalPE, despite that being the documented "canonical"
-    # design. This is a real conflict between the working doc and the
-    # deployed code, not just a style difference — decayed sinusoidal PE
-    # has a real rationale for CH too (irregular filing intervals), so
-    # this is kept as an explicit choice rather than silently resolved.
-    # Default matches model.py per the "reconcile as-is" instruction.
-    positional_encoding_type: str = "learned"  # "learned" | "decayed_sinusoidal"
+    # RESOLVED: CORTEX_ARCHITECTURE.md (the canonical spec, confirmed against
+    # model_v2.py — the current working GDELT implementation) confirms
+    # DecayedSinusoidalPE (fixed, alpha=1.0) is correct. model.py (used for
+    # the earlier reconciliation) was the STALE v1 file; 'learned' is kept
+    # available for compatibility but is no longer the default.
+    positional_encoding_type: str = "decayed_sinusoidal"  # "decayed_sinusoidal" | "learned"
     max_seq_len: int = 512  # only used when positional_encoding_type == "learned"
-    pe_alpha: float = 1.0  # fixed, not learned — only used when "decayed_sinusoidal"
-    pe_max_period: float = 10000.0  # only used when "decayed_sinusoidal"
+    pe_alpha: float = 1.0  # fixed, not learned
+    pe_max_period: float = 10000.0
 
     dropout: float = 0.1
 

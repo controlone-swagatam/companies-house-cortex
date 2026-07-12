@@ -1,19 +1,22 @@
 """
-Training loop for CompaniesHouseModel.
+Two-phase training loop, per CORTEX_ARCHITECTURE.md §3.
 
-Param groups follow the convention seen elsewhere in this codebase
-(neo_cortex_model.py's get_param_groups): gate parameters get a much
-higher learning rate than the rest of the model, since HardConcreteGate's
-log_alpha needs to move fast relative to the encoder/embedding weights to
-find a useful sparsity level within a reasonable number of steps.
+Phase 1 (epochs 0 .. phase1_epochs-1):
+    Gate 1 trains (dynamic lambda1, target 0.15). Gate 2 frozen at
+    log_alpha=0.0 (~0.5 gate value, pass-through, no selection pressure).
+Phase 2 (epochs phase1_epochs .. end):
+    Gate 1 binarized (+5.0/-5.0 per position) and frozen at its Phase-1
+    end state. Gate 2 unfrozen, trains (dynamic lambda2, target 0.05).
 
-Sparsity penalty: model.py's HardConcreteGate.l0_loss() returns a raw sum
-over positions, not a rate — normalized here by seq_len and penalized
-toward a target_sparsity via L1 distance, weighted by sparsity_lambda.
-This is a fixed-weight penalty, not the two-gate dynamic lambda controller
-described in the working doc's canonical reference (that's a two-gate
-design; this model has one gate, matching model.py) — a fixed weight is
-the simpler starting point, worth revisiting if training proves unstable.
+Loss = L_MLM + lambda_k * (L0_k/N - target_k)^2, where k is whichever
+gate is currently active/trainable in the current phase — the frozen
+gate's sparsity term is dropped (not just zero-weighted) since it has no
+gradient to receive anyway.
+
+Param groups: gate parameters get a much higher LR than the rest of the
+model, matching the convention elsewhere in this codebase
+(neo_cortex_model.py's get_param_groups) — HardConcreteGate's log_alpha
+needs to move fast relative to encoder/embedding weights.
 """
 import argparse
 import logging
@@ -25,13 +28,14 @@ from torch.utils.data import DataLoader
 from model.companies_house_model import CompaniesHouseModel
 from model.config import EmbeddingConfig
 from model.dataset import CompanySequenceDataset, collate_fn, load_company_sequences
+from model.hstu import dynamic_lambda
 from model.vocab import EventVocab
 
 logger = logging.getLogger("ch_pipeline.model.train")
 
 
 def get_param_groups(model: CompaniesHouseModel, base_lr: float, gate_lr_multiplier: float = 50.0):
-    gate_params = list(model.encoder.gate.parameters())
+    gate_params = list(model.encoder.gate1.parameters()) + list(model.encoder.gate2.parameters())
     gate_ids = {id(p) for p in gate_params}
     other_params = [p for p in model.parameters() if id(p) not in gate_ids]
 
@@ -41,12 +45,25 @@ def get_param_groups(model: CompaniesHouseModel, base_lr: float, gate_lr_multipl
     ]
 
 
-def sparsity_penalty(model: CompaniesHouseModel, seq_len: int, target_sparsity: float) -> torch.Tensor:
-    raw_l0 = model.encoder.l0_loss()  # sum over up to max_seq_len positions
-    # normalize by the actual gate length used (min of seq_len, gate's max_seq_len)
-    gate_len = min(seq_len, model.encoder.gate.log_alpha.shape[0])
-    open_rate = raw_l0 / gate_len
-    return torch.abs(open_rate - target_sparsity)
+def phase_sparsity_loss(
+    model: CompaniesHouseModel, seq_len: int, phase: int,
+) -> torch.Tensor:
+    """
+    Returns the sparsity penalty for whichever gate is active in the
+    current phase. Phase 1 -> gate1 (target from encoder.gate1_target),
+    Phase 2 -> gate2. Dynamic lambda computed from that gate's
+    deterministic (eval-style) values, per the canonical spec.
+    """
+    encoder = model.encoder
+    gate = encoder.gate1 if phase == 1 else encoder.gate2
+    target = encoder.gate1_target if phase == 1 else encoder.gate2_target
+
+    gate_len = min(seq_len, gate.log_alpha.shape[0])
+    det_values = gate.deterministic_gate_values(gate_len)
+    lam = dynamic_lambda(det_values)
+
+    l0_rate = encoder.l0_rate(gate, seq_len)
+    return lam * (l0_rate - target) ** 2
 
 
 @torch.no_grad()
@@ -92,12 +109,12 @@ def train(
     eval_paths: list[str],
     vocab_path: str,
     output_dir: str,
-    epochs: int = 10,
+    epochs: int = 50,
+    phase1_epochs: int = 25,
     batch_size: int = 16,
     max_seq_len: int = 64,
+    min_context: int = 1,
     base_lr: float = 1e-3,
-    target_sparsity: float = 0.15,
-    sparsity_lambda: float = 1.0,
     device: str = "cpu",
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
@@ -122,17 +139,35 @@ def train(
         logger.info("Eval sequences: %d", len(eval_ds))
 
     cfg = EmbeddingConfig(max_seq_len=max_seq_len)
-    model = CompaniesHouseModel(vocab, cfg, max_seq_len=max_seq_len).to(device)
+    model = CompaniesHouseModel(vocab, cfg, max_seq_len=max_seq_len, min_context=min_context).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model: %d trainable params", n_params)
+
+    # Phase 1 setup: Gate 2 frozen at pass-through from the start.
+    model.encoder.gate2.freeze_at_zero()
+    phase = 1
+    logger.info("Phase 1 started: Gate 1 training (target %.2f), Gate 2 frozen at pass-through",
+                model.encoder.gate1_target)
 
     optimizer = torch.optim.AdamW(get_param_groups(model, base_lr))
 
     for epoch in range(epochs):
+        if epoch == phase1_epochs and phase == 1:
+            model.encoder.gate1.binarize_and_freeze()
+            model.encoder.gate2.unfreeze()
+            phase = 2
+            # New optimizer: param groups changed (gate1 now has no grad,
+            # gate2 does) — rebuild rather than silently carrying stale
+            # momentum state for now-frozen gate1 params.
+            optimizer = torch.optim.AdamW(get_param_groups(model, base_lr))
+            logger.info("Phase 2 started: Gate 1 binarized+frozen, Gate 2 training (target %.2f)",
+                        model.encoder.gate2_target)
+
         model.train()
         epoch_losses = {"total_loss": 0.0, "category_loss": 0.0, "type_loss": 0.0,
                          "subtype_loss": 0.0, "sparsity_loss": 0.0}
         n_batches = 0
+        n_skipped_nonfinite = 0
 
         for batch in train_dl:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -140,8 +175,18 @@ def train(
                 batch["category_ids"], batch["type_ids"], batch["subtype_ids"],
                 batch["company_ids"], batch["positions"], batch["attention_mask"],
             )
-            sp_loss = sparsity_penalty(model, batch["category_ids"].shape[1], target_sparsity)
-            loss = out["total_loss"] + sparsity_lambda * sp_loss
+            sp_loss = phase_sparsity_loss(model, batch["category_ids"].shape[1], phase)
+            loss = out["total_loss"] + sp_loss
+
+            if not torch.isfinite(loss):
+                n_skipped_nonfinite += 1
+                logger.warning(
+                    "Non-finite loss on a batch (epoch %d, phase %d) — skipping optimizer step. "
+                    "total_loss=%s sparsity=%s",
+                    epoch + 1, phase, out["total_loss"].item(), sp_loss.item(),
+                )
+                optimizer.zero_grad()
+                continue
 
             optimizer.zero_grad()
             loss.backward()
@@ -156,10 +201,16 @@ def train(
             n_batches += 1
 
         avg = {k: v / max(n_batches, 1) for k, v in epoch_losses.items()}
+        active_gate_rate = model.encoder.l0_rate(
+            model.encoder.gate1 if phase == 1 else model.encoder.gate2, max_seq_len
+        ).item()
         logger.info(
-            "Epoch %d/%d | loss=%.4f (cat=%.4f type=%.4f subtype=%.4f) sparsity=%.4f",
-            epoch + 1, epochs, avg["total_loss"], avg["category_loss"],
+            "Epoch %d/%d [phase %d] | loss=%.4f (cat=%.4f type=%.4f subtype=%.4f) "
+            "sparsity=%.4f gate%d_rate=%.4f%s",
+            epoch + 1, epochs, phase, avg["total_loss"], avg["category_loss"],
             avg["type_loss"], avg["subtype_loss"], avg["sparsity_loss"],
+            phase, active_gate_rate,
+            f" | skipped {n_skipped_nonfinite} non-finite batches" if n_skipped_nonfinite else "",
         )
 
         if eval_dl is not None:
@@ -174,6 +225,7 @@ def train(
         checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch{epoch+1}.pt")
         torch.save({
             "epoch": epoch + 1,
+            "phase": phase,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "vocab_path": vocab_path,
@@ -185,17 +237,19 @@ def train(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    parser = argparse.ArgumentParser(description="Train CompaniesHouseModel")
-    parser.add_argument("--train-input", nargs="+", required=True, help="derived_events period_1 JSONL file(s)")
-    parser.add_argument("--eval-input", nargs="*", default=[], help="derived_events period_2 JSONL file(s)")
+    parser = argparse.ArgumentParser(description="Train CompaniesHouseModel (two-phase)")
+    parser.add_argument("--train-input", nargs="+", required=True)
+    parser.add_argument("--eval-input", nargs="*", default=[])
     parser.add_argument("--vocab", required=True)
     parser.add_argument("--output-dir", default="./checkpoints")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--phase1-epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=64)
+    parser.add_argument("--min-context", type=int, default=1,
+                         help="Min real predecessors before a position is maskable. "
+                              "CH default is 1 (not GDELT's 10) — see companies_house_model.py")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--target-sparsity", type=float, default=0.15)
-    parser.add_argument("--sparsity-lambda", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -205,11 +259,11 @@ def main() -> None:
         vocab_path=args.vocab,
         output_dir=args.output_dir,
         epochs=args.epochs,
+        phase1_epochs=args.phase1_epochs,
         batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
+        min_context=args.min_context,
         base_lr=args.lr,
-        target_sparsity=args.target_sparsity,
-        sparsity_lambda=args.sparsity_lambda,
         device=args.device,
     )
 

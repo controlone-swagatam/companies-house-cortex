@@ -116,24 +116,25 @@ class LearnedPositionalEmbedding(nn.Module):
 
 class DecayedSinusoidalPE(nn.Module):
     """
-    Fixed (not learned) sinusoidal positional encoding, decayed by elapsed
-    time since sequence start. α=1.0.
+    Fixed (not learned) sinusoidal positional encoding, decayed so the MOST
+    RECENT real event in each sequence gets the strongest signal and older
+    events decay away — per CORTEX_ARCHITECTURE.md §2.1 ("newest position
+    2.7x stronger than oldest", alpha=1.0 default).
 
-    NOTE: this is the "canonical" design per the working doc, but model.py
-    (the actual GDELT reference code) uses LearnedPositionalEmbedding
-    instead — see EmbeddingConfig.positional_encoding_type. Kept here as an
-    option since decayed sinusoidal PE has a real rationale for CH's
-    irregular filing intervals, but it's not what's currently deployed for
-    GDELT, so don't assume this is the active default without checking the
-    config.
-
-    PE(t, 2i)   = sin(t / max_period^(2i/D))
-    PE(t, 2i+1) = cos(t / max_period^(2i/D))
-    decayed by exp(-α * t / 365) as a recency envelope on the encoding's
-    amplitude — distant-past events get a damped positional signal.
-
-    No learnable parameters. div_term is precomputed as a buffer since D
-    and max_period are fixed at construction.
+    IMPORTANT DIRECTIONALITY NOTE: the canonical formula PE(pos,2i) =
+    exp(-alpha*pos/N)*sin(pos/...) decays with INCREASING pos. Taken
+    literally with pos = standard forward-chronological index (0=oldest,
+    L-1=newest, the ordering causal masking requires — "i cannot attend to
+    j>i" only makes sense chronologically forward), that would make the
+    OLDEST event strongest and decay TOWARD the newest — the opposite of
+    what the doc claims in prose. The only self-consistent reading is that
+    the doc's "pos" means "steps back from the most recent real event",
+    not raw forward index. That's what's implemented here: pos_for_pe =
+    (real_length - 1) - forward_position, computed per-sequence using
+    attention_mask so padding doesn't corrupt which position counts as
+    "most recent". Forward-chronological indexing is preserved for
+    everything else (embeddings, causal masking) — only the PE's internal
+    phase/decay variable is reversed.
     """
 
     def __init__(self, cfg: EmbeddingConfig):
@@ -146,15 +147,38 @@ class DecayedSinusoidalPE(nn.Module):
         self.register_buffer("div_term", div_term)  # [D/2]
         self.embed_dim = D
 
-    def forward(self, elapsed_days: torch.Tensor) -> torch.Tensor:  # [B, L] -> [B, L, D]
-        t = elapsed_days.unsqueeze(-1).float()  # [B, L, 1]
-        angles = t * self.div_term  # [B, L, D/2]
+    def forward(
+        self,
+        positions: torch.Tensor,  # [B, L] standard forward-chronological indices (0=oldest)
+        attention_mask: Optional[torch.Tensor] = None,  # [B, L] bool, True = real token
+    ) -> torch.Tensor:  # [B, L, D]
+        if attention_mask is not None:
+            real_lengths = attention_mask.sum(dim=1, keepdim=True).float()  # [B, 1]
+        else:
+            real_lengths = torch.full(
+                (positions.shape[0], 1), float(positions.shape[1]), device=positions.device
+            )
 
-        pe = torch.zeros(*elapsed_days.shape, self.embed_dim, device=elapsed_days.device)
+        # "steps back from the most recent real position" — 0 at the last
+        # real event, increasing going further into the past.
+        steps_from_recent = (real_lengths - 1) - positions.float()  # [B, L]
+
+        angles = steps_from_recent.unsqueeze(-1) * self.div_term  # [B, L, D/2]
+        pe = torch.zeros(*positions.shape, self.embed_dim, device=positions.device)
         pe[..., 0::2] = torch.sin(angles)
         pe[..., 1::2] = torch.cos(angles)
 
-        decay = torch.exp(-self.alpha * elapsed_days.float() / 365.0).unsqueeze(-1)  # [B, L, 1]
+        # Normalization constant N = each sequence's OWN (real_length - 1),
+        # not a fixed global max_seq_len. This is what makes "newest 2.7x
+        # stronger than oldest" (alpha=1.0 -> ratio = e^alpha ~ 2.718) hold
+        # universally regardless of how long a given sequence actually is —
+        # the oldest position in ANY sequence is always exactly alpha
+        # e-foldings old relative to that sequence's own span. Using a fixed
+        # max_seq_len instead (tried first, verified wrong in testing) made
+        # short sequences barely decay at all relative to a much larger
+        # constant, giving a ~1.15x ratio instead of the intended ~2.7x.
+        norm_const = (real_lengths - 1).clamp(min=1)  # [B, 1], avoid div-by-zero for length-1
+        decay = torch.exp(-self.alpha * steps_from_recent.clamp(min=0) / norm_const).unsqueeze(-1)
         return pe * decay
 
 
@@ -229,7 +253,10 @@ class InputEmbeddingStack(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,  # [B, L] True = real token
     ) -> torch.Tensor:                # [B, L, D]
         x = self.event_embedding(category_ids, type_ids, subtype_ids)
-        x = x + self.positional_encoding(position_or_elapsed)
+        if self.cfg.positional_encoding_type == "decayed_sinusoidal":
+            x = x + self.positional_encoding(position_or_elapsed, attention_mask)
+        else:
+            x = x + self.positional_encoding(position_or_elapsed)
         x = x + self.entity_embedding(company_ids).unsqueeze(1)  # broadcast [B, D] -> [B, L, D]
 
         if self.semantic_embedding is not None:

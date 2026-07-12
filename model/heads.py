@@ -58,6 +58,25 @@ class HierarchicalPredictionHead(nn.Module):
         return category_logits, type_logits, subtype_logits
 
 
+def _safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    Standard CrossEntropyLoss(ignore_index=-100), but returns 0.0 instead of
+    NaN when a batch has zero valid (non-ignored) targets — which happens
+    more often than it sounds with small eval sets, short sequences, and a
+    15% mask rate: it's easy for an entire batch to randomly draw zero
+    masked positions for a given level. PyTorch's mean-reduction CE divides
+    by the count of valid targets, which is 0 in that case -> NaN. This
+    guards that division rather than letting NaN propagate into logged
+    metrics (it never affected model weights, since eval has no backward
+    pass — but it corrupted the reported eval_loss average).
+    """
+    valid = labels != -100
+    if not valid.any():
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    ce = nn.CrossEntropyLoss(ignore_index=-100)
+    return ce(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+
+
 def hierarchical_mlm_loss(
     category_logits: torch.Tensor,
     type_logits: torch.Tensor,
@@ -67,17 +86,14 @@ def hierarchical_mlm_loss(
     subtype_labels: torch.Tensor,
 ) -> dict:
     """
-    Independent cross-entropy per level at masked positions (ignore_index=-100
-    handles unmasked positions automatically). Returns per-level losses plus
-    the summed total, so a caller can log/weight them separately if the
-    level losses turn out to need different weighting (e.g. if subtype loss
-    dominates given its much larger vocab).
+    Independent cross-entropy per level at masked positions. Returns
+    per-level losses plus the summed total, so a caller can log/weight them
+    separately if the level losses turn out to need different weighting
+    (e.g. if subtype loss dominates given its much larger vocab).
     """
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
-
-    category_loss = ce(category_logits.reshape(-1, category_logits.size(-1)), category_labels.reshape(-1))
-    type_loss = ce(type_logits.reshape(-1, type_logits.size(-1)), type_labels.reshape(-1))
-    subtype_loss = ce(subtype_logits.reshape(-1, subtype_logits.size(-1)), subtype_labels.reshape(-1))
+    category_loss = _safe_cross_entropy(category_logits, category_labels)
+    type_loss = _safe_cross_entropy(type_logits, type_labels)
+    subtype_loss = _safe_cross_entropy(subtype_logits, subtype_labels)
 
     return {
         "category_loss": category_loss,

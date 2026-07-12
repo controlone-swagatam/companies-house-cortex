@@ -1,22 +1,28 @@
 """
-MLM-style masking for causal training.
+Masking for causal training, per CORTEX_ARCHITECTURE.md (confirmed spec,
+not the BERT-style random masking used in the earlier draft):
 
-Standard BERT-style masking (~15% of positions, mask/random/keep split)
-applied to category_ids/type_ids/subtype_ids jointly — a masked *event*
-means all three levels at that position are masked together, since they
-describe the same underlying filing (doesn't make sense to mask category
-but not type for the same event).
+  - Only positions with >= min_context (default 10) real predecessors are
+    eligible for masking — a masked position needs enough antecedent
+    context to make prediction meaningful, not just "not padding".
+  - Mask the LAST mlm_mask_frac (default 0.15) fraction of each sequence's
+    eligible positions — i.e. a contiguous suffix ending at the sequence's
+    last real event, not scattered random positions. This is a much
+    closer fit to "predict what happens next" than classic BERT MLM: the
+    model is trained specifically to predict the most recent stretch of
+    events given everything before it.
+  - Masked positions are replaced with the MASK token 100% of the time —
+    no BERT-style 80/10/10 mask/random/keep mixture, since that mixture
+    isn't part of the confirmed spec and isn't obviously motivated here.
 
-Combined with causal attention (HSTUBlock(causal=True)) in the encoder,
-so a masked position's prediction is conditioned only on genuinely earlier
-events in the sequence — consistent with §9's "date, not action_date"
-no-future-leakage principle. This is stricter than standard BERT (which
-uses full bidirectional context even for masked positions) but matches
-what we actually need: a model usable for real next-event-style inference,
-not just an offline pretraining objective.
-
-PAD positions (attention_mask == False) are never eligible for masking.
+Combined with causal attention, a masked position within the suffix block
+can still attend to EARLIER masked positions in that same block (only
+future positions are blocked) — this is intentional, not a leak: it's the
+standard behaviour for this kind of infilling objective, and those earlier
+masked positions carry no information beyond "something was masked here"
+since their embeddings are the MASK token, not their true values.
 """
+import math
 from dataclasses import dataclass
 
 import torch
@@ -24,13 +30,13 @@ import torch
 
 @dataclass
 class MaskedBatch:
-    category_ids: torch.Tensor    # masked input ids
+    category_ids: torch.Tensor
     type_ids: torch.Tensor
     subtype_ids: torch.Tensor
-    category_labels: torch.Tensor  # original ids at masked positions, -100 elsewhere (CE ignore_index)
+    category_labels: torch.Tensor  # original ids at masked positions, -100 elsewhere
     type_labels: torch.Tensor
     subtype_labels: torch.Tensor
-    mask_positions: torch.Tensor   # [B, L] bool — which positions were masked
+    mask_positions: torch.Tensor   # [B, L] bool
 
 
 def apply_mlm_masking(
@@ -41,47 +47,36 @@ def apply_mlm_masking(
     category_mask_id: int,
     type_mask_id: int,
     subtype_mask_id: int,
-    n_categories: int,
+    n_categories: int,   # unused now (kept for call-site compatibility — no random-token corruption anymore)
     n_types: int,
     n_subtypes: int,
-    mask_prob: float = 0.15,
-    mask_token_prob: float = 0.8,   # of masked positions: 80% -> MASK token
-    random_token_prob: float = 0.1,  # 10% -> random token, 10% -> unchanged (standard BERT split)
+    mask_prob: float = 0.15,   # mlm_mask_frac in the canonical naming
+    min_context: int = 1,  # CH default (see companies_house_model.py) — NOT GDELT's 10
 ) -> MaskedBatch:
+    B, L = category_ids.shape
     device = category_ids.device
-    shape = category_ids.shape
 
-    # Eligible = real tokens only (never mask padding)
-    eligible = attention_mask.clone()
-    rand = torch.rand(shape, device=device)
-    mask_positions = eligible & (rand < mask_prob)
+    mask_positions = torch.zeros(B, L, dtype=torch.bool, device=device)
 
-    # Labels: original id at masked positions, -100 (CE ignore_index) elsewhere
+    for b in range(B):
+        real_length = int(attention_mask[b].sum().item())
+        n_eligible = max(0, real_length - min_context)
+        n_to_mask = math.ceil(mask_prob * n_eligible)
+        if n_to_mask > 0:
+            # last n_to_mask positions of the real sequence (indices
+            # real_length - n_to_mask .. real_length - 1)
+            mask_positions[b, real_length - n_to_mask: real_length] = True
+
     category_labels = torch.where(mask_positions, category_ids, torch.full_like(category_ids, -100))
     type_labels = torch.where(mask_positions, type_ids, torch.full_like(type_ids, -100))
     subtype_labels = torch.where(mask_positions, subtype_ids, torch.full_like(subtype_ids, -100))
 
-    # 80/10/10 split within masked positions
-    action_rand = torch.rand(shape, device=device)
-    use_mask_token = mask_positions & (action_rand < mask_token_prob)
-    use_random_token = mask_positions & (action_rand >= mask_token_prob) & (
-        action_rand < mask_token_prob + random_token_prob
-    )
-    # remaining masked positions (~10%) keep original value — no action needed
-
     category_out = category_ids.clone()
     type_out = type_ids.clone()
     subtype_out = subtype_ids.clone()
-
-    category_out[use_mask_token] = category_mask_id
-    type_out[use_mask_token] = type_mask_id
-    subtype_out[use_mask_token] = subtype_mask_id
-
-    if use_random_token.any():
-        n_random = int(use_random_token.sum().item())
-        category_out[use_random_token] = torch.randint(2, n_categories, (n_random,), device=device)
-        type_out[use_random_token] = torch.randint(2, n_types, (n_random,), device=device)
-        subtype_out[use_random_token] = torch.randint(2, n_subtypes, (n_random,), device=device)
+    category_out[mask_positions] = category_mask_id
+    type_out[mask_positions] = type_mask_id
+    subtype_out[mask_positions] = subtype_mask_id
 
     return MaskedBatch(
         category_ids=category_out,
